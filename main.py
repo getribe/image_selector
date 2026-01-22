@@ -288,9 +288,23 @@ class AsyncSmartRouter:
             if not img: continue
             
             check_prompt = f"""
-            Czy to zdjęcie pasuje do tematu: "{text_fragment[:200]}"?
-            Odrzuć grafiki, tekst, wektory.
+            Aby ocenić, czy dany obraz jest **tematycznie zgodny** z tekstem, wykonaj następujące zadania:
+            KROK 1:
+                - Sprawdź, czy plik to **rzeczywiste zdjęcie (bitmapa)** przedstawiające scenę, przedmiot, osobę, miejsce itp.
+                - Odrzuć **grafiki wektorowe, ikony, schematy, tekst, mockupy, schematy**, rysunki kreskówkowe lub generowane miniatury.
+            KROK 2:
+                - Oceń, czy zawartość zdjęcia **wiąże się logicznie i semantycznie z podanym tekstem**.
+            KROK 3:
+                - Nie zgaduj — jeżeli zdjęcie jest niejasne lub niepewne — uznaj, że nie pasuje.
+                
+            Wejście:
+            Tekst do porównania: "{text_fragment[:200]}"
+            
             JSON: {{ "suitable": true/false, "reason": "..." }}
+            
+            Przykłady:
+                - jeżeli zdjęcie przedstawia scenę opisaną w tekście → suitable: true
+                - jeżeli jest to wizualizacja wykresu, wektor, meme lub nie ma związku → suitable: false
             """
             try:
                 res = await self.llm_model.generate_content_async([check_prompt, img], generation_config={"response_mime_type": "application/json"})
