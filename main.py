@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import List
 from PIL import Image
+from google.api_core.exceptions import ResourceExhausted
 
 # Logging & Observability
 from pythonjsonlogger import jsonlogger
@@ -27,6 +28,7 @@ from transformers import AutoProcessor, AutoModel
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+
 # --- KONFIGURACJA LOGOWANIA (Loki & Tempo Friendly) ---
 
 class TraceContextFilter(logging.Filter):
@@ -34,11 +36,12 @@ class TraceContextFilter(logging.Filter):
     Filtr dodający trace_id i span_id do każdego rekordu logu.
     Dzięki temu Loki będzie mógł skorelować logi z Tempo.
     """
+
     def filter(self, record):
         # Domyślne wartości
         record.trace_id = ""
         record.span_id = ""
-        
+
         try:
             # Próbujemy pobrać kontekst z OpenTelemetry (nawet jak jest wstrzyknięte auto-instrumentation)
             from opentelemetry import trace
@@ -49,37 +52,39 @@ class TraceContextFilter(logging.Filter):
                     record.trace_id = f"{ctx.trace_id:032x}"
                     record.span_id = f"{ctx.span_id:016x}"
         except ImportError:
-            pass # OTel nie jest zainstalowany lub dostępny
+            pass  # OTel nie jest zainstalowany lub dostępny
         except Exception:
-            pass # Inny błąd, nie chcemy przerywać logowania
-            
+            pass  # Inny błąd, nie chcemy przerywać logowania
+
         return True
+
 
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
+
     handler = logging.StreamHandler(sys.stdout)
-    
+
     # Format JSON zawierający timestamp, poziom, wiadomość i klucze tracingowe
     formatter = jsonlogger.JsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s %(trace_id)s %(span_id)s',
         rename_fields={"levelname": "level", "asctime": "timestamp"},
         datefmt='%Y-%m-%dT%H:%M:%SZ'
     )
-    
+
     handler.setFormatter(formatter)
     handler.addFilter(TraceContextFilter())
-    
+
     # Usuwamy domyślne handlery (żeby nie dublować logów)
     if logger.hasHandlers():
         logger.handlers.clear()
-        
+
     logger.addHandler(handler)
-    
+
     # Wyciszenie bibliotek, które mogą za bardzo hałasować
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING) # Uvicorn ma własne logi access
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # Uvicorn ma własne logi access
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 setup_logging()
 logger = logging.getLogger("ImageService")
@@ -95,6 +100,7 @@ if GOOGLE_GENAI_KEY:
     genai.configure(api_key=GOOGLE_GENAI_KEY)
 else:
     logger.critical("Brak klucza GOOGLE_GENAI_KEY! Aplikacja nie zadziała poprawnie.")
+
 
 # ==========================================
 # CZĘŚĆ 1: TWOJA LOGIKA (KLASY POMOCNICZE)
@@ -117,6 +123,7 @@ class CostCalculator:
             "total_output_tokens": self.total_output
         })
 
+
 class LocalVisualRanker:
     def __init__(self):
         logger.info("Inicjalizacja modelu SigLIP...", extra={"event": "model_loading_start"})
@@ -135,30 +142,49 @@ class LocalVisualRanker:
         if not images: return []
         texts = [text_query] * len(images)
         try:
-            inputs = self.processor(text=texts, images=images, padding="max_length", return_tensors="pt", truncation=True).to(self.device)
+            inputs = self.processor(text=texts, images=images, padding="max_length", return_tensors="pt",
+                                    truncation=True).to(self.device)
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 logits = outputs.logits_per_image[:, 0]
                 probs = torch.sigmoid(logits)
             results = probs.tolist()
-            
+
             # Logujemy statystyki rankingu
             res_list = [results] if isinstance(results, float) else results
             logger.info("Ranking zakończony", extra={
-                "image_count": len(images), 
+                "image_count": len(images),
                 "max_score": max(res_list) if res_list else 0
             })
-            
+
             return res_list
         except Exception as e:
             logger.error("Błąd podczas rankowania obrazów", exc_info=True)
             return [0.0] * len(images)
 
+
 class AsyncSmartRouter:
     def __init__(self):
         self.cost_calc = CostCalculator()
-        self.ranker = LocalVisualRanker() # Model ładuje się tutaj
-        self.llm_model = genai.GenerativeModel('gemini-2.0-flash-exp') 
+        self.ranker = LocalVisualRanker()  # Model ładuje się tutaj
+        self.llm_model = genai.GenerativeModel('gemini-3-flash-preview')
+        # Prosty limiter: serializuje requesty do Gemini; retry z odczekaniem tylko na 429.
+        self._gemini_lock = asyncio.Lock()
+
+    async def _gemini_generate(self, *args, **kwargs):
+        async with self._gemini_lock:
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await self.llm_model.generate_content_async(*args, **kwargs)
+                except ResourceExhausted:
+                    if attempt >= max_attempts:
+                        raise
+                    logger.warning(
+                        "Gemini quota hit (429), czekam 25s przed ponowieniem",
+                        extra={"wait_seconds": 25, "attempt": attempt},
+                    )
+                    await asyncio.sleep(25)
 
     async def _fetch_json(self, session, url, params=None, headers=None, source="API"):
         start_time = time.time()
@@ -169,7 +195,8 @@ class AsyncSmartRouter:
                     logger.debug(f"Fetch success: {source}", extra={"url": url, "duration": duration, "source": source})
                     return await response.json()
                 else:
-                    logger.warning(f"Fetch failed: {source}", extra={"status_code": response.status, "url": url, "source": source})
+                    logger.warning(f"Fetch failed: {source}",
+                                   extra={"status_code": response.status, "url": url, "source": source})
         except Exception as e:
             logger.error(f"Fetch error: {source}", exc_info=True, extra={"url": url, "source": source})
         return None
@@ -188,57 +215,106 @@ class AsyncSmartRouter:
         tasks = []
         # Pexels
         if PEXELS_API_KEY:
-            tasks.append(self._fetch_json(session, "https://api.pexels.com/v1/search", 
-                {"query": query, "per_page": limit}, {"Authorization": PEXELS_API_KEY}, source="Pexels"))
+            tasks.append(self._fetch_json(session, "https://api.pexels.com/v1/search",
+                                          {"query": query, "per_page": limit}, {"Authorization": PEXELS_API_KEY},
+                                          source="Pexels"))
         # Pixabay
         if PIXABAY_API_KEY:
-            tasks.append(self._fetch_json(session, "https://pixabay.com/api/", 
-                {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo", "safesearch": "true", "per_page": limit}, source="Pixabay"))
+            tasks.append(self._fetch_json(session, "https://pixabay.com/api/",
+                                          {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo",
+                                           "safesearch": "true", "per_page": limit}, source="Pixabay"))
         # Unsplash
         if UNSPLASH_ACCESS_KEY:
-            tasks.append(self._fetch_json(session, "https://api.unsplash.com/search/photos", 
-                {"query": query, "per_page": limit}, {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}, source="Unsplash"))
-        
+            tasks.append(
+                self._fetch_json(
+                    session,
+                    "https://api.unsplash.com/search/photos",
+                    {
+                        "query": query,
+                        "per_page": limit,
+                        "content_filter": "high",
+                        "orientation": "landscape",
+                        "order_by": "relevant",
+                        "lang": "en"
+                    },
+                    {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+                    source="Unsplash"
+                )
+            )
+
         results = []
         responses = await asyncio.gather(*tasks)
-        
+
         # Parsowanie wyników
         for data in responses:
             if not data: continue
             # Pexels
-            if 'photos' in data: 
-                results.extend([{"source": "Pexels", "thumb_url": p['src']['medium'], "full_url": p['src']['original'], "id": str(p['id'])} for p in data['photos']])
+            if 'photos' in data:
+                results.extend([{"source": "Pexels", "thumb_url": p['src']['medium'], "full_url": p['src']['original'],
+                                 "id": str(p['id'])} for p in data['photos']])
             # Pixabay
             elif 'hits' in data:
-                results.extend([{"source": "Pixabay", "thumb_url": h.get('webformatURL'), "full_url": h.get('largeImageURL'), "id": str(h['id'])} for h in data['hits']])
+                results.extend([{"source": "Pixabay", "thumb_url": h.get('webformatURL'),
+                                 "full_url": h.get('largeImageURL'), "id": str(h['id'])} for h in data['hits']])
             # Unsplash
             elif 'results' in data:
-                results.extend([{"source": "Unsplash", "thumb_url": i['urls']['small'], "full_url": i['urls']['regular'], "id": i['id']} for i in data['results']])
-        
+                results.extend([{"source": "Unsplash", "thumb_url": i['urls']['small'],
+                                 "full_url": i['urls']['regular'], "id": i['id']} for i in data['results']])
+
         logger.info(f"Znaleziono kandydatów dla '{query}'", extra={"count": len(results), "query": query})
         return results
 
     # --- MAIN LOGIC ---
-    async def process_article(self, text_fragment):
+    async def process_article(self, text_fragment, *, allow_fallback: bool = True):
         # 1. GENEROWANIE ZAPYTAŃ
         logger.info("Rozpoczynanie analizy artykułu", extra={"text_length": len(text_fragment)})
-        
+
         prompt = f"""
-        Jesteś fotoedytorem. Artykuł: "{text_fragment[:500]}..."
-        Zwróć JSON: {{ "queries": ["proste hasło 1", "proste hasło 2"], "visual_subject": "ogólny obiekt (np. glass building)" }}
+        Otrzymujesz fragment artykułu:
+        "{text_fragment[:500]}..."
+
+        KROK 1:
+            Twoim zadaniem jest dobrać słowa kluczowe, które pozwolą przedstawić treść artykułu jednym zdjęciem.
+        KROK 2:
+            Zwrócona treść, zwłaszcza słowa kluczowe muszą być w języku Angielskim.
+        KROK 3:
+        Zwróć WYŁĄCZNIE poprawny JSON:
+        {{
+          "queries": ["str", "str"],
+          "visual_subject": "konkretny, namacalny obiekt lub scena (bez abstraktów)"
+        }}
         """
         try:
-            resp = await self.llm_model.generate_content_async(prompt, generation_config={"response_mime_type": "application/json"})
+            resp = await self._gemini_generate(
+                prompt,
+                generation_config={"response_mime_type": "application/json"},
+            )
             self.cost_calc.add_gemini_usage(resp.usage_metadata)
             plan = json.loads(resp.text)
         except Exception as e:
             logger.error("Błąd generowania promptów w Gemini", exc_info=True)
             return []
 
+        if isinstance(plan, list):
+            if all(isinstance(item, str) for item in plan):
+                plan = {"queries": plan}
+            else:
+                plan = next(
+                    (
+                        item for item in plan
+                        if isinstance(item, dict)
+                           and ("queries" in item or "visual_subject" in item)
+                    ),
+                    {},
+                )
+        if not isinstance(plan, dict):
+            logger.error("Nieprawidłowy format planu", extra={"plan_type": type(plan).__name__})
+            return []
+
         queries = plan.get("queries", [])[:2]
         visual_subject = plan.get("visual_subject", "scene")
         siglip_prompt = f"a photo of {visual_subject}"
-        
+
         logger.info("Wygenerowano plan", extra={"queries": queries, "siglip_prompt": siglip_prompt})
 
         # 2. POBIERANIE METADANYCH
@@ -247,36 +323,36 @@ class AsyncSmartRouter:
             tasks = [self.search_stock(session, q) for q in queries]
             groups = await asyncio.gather(*tasks)
             for g in groups: candidates.extend(g)
-        
+
         # Deduplikacja
         unique = {c['thumb_url']: c for c in candidates if c.get('thumb_url')}.values()
         candidates = list(unique)
-        
-        if not candidates: 
+
+        if not candidates:
             logger.warning("Nie znaleziono żadnych zdjęć w API")
             return []
 
         # 3. RANKING SIGLIP
         to_check = candidates[:15]
         loop = asyncio.get_running_loop()
-        
+
         # Download images
         futures = [loop.run_in_executor(None, self._download_image_sync, c['thumb_url']) for c in to_check]
         imgs = await asyncio.gather(*futures)
-        
+
         valid_cands, valid_imgs = [], []
         for c, img in zip(to_check, imgs):
             if img:
                 valid_cands.append(c)
                 valid_imgs.append(img)
-        
-        if not valid_imgs: 
+
+        if not valid_imgs:
             logger.error("Błąd pobierania obrazków do analizy (wszystkie pobierania nieudane)")
             return []
 
         scores = await loop.run_in_executor(None, self.ranker.rank_images, siglip_prompt, valid_imgs)
         for c, s in zip(valid_cands, scores): c['siglip_score'] = s
-        
+
         valid_cands.sort(key=lambda x: x['siglip_score'], reverse=True)
         top_cands = valid_cands[:5]
 
@@ -286,44 +362,35 @@ class AsyncSmartRouter:
         for c in top_cands:
             img = self._download_image_sync(c['thumb_url'])
             if not img: continue
-            
+
             check_prompt = f"""
-            Aby ocenić, czy dany obraz jest **tematycznie zgodny** z tekstem, wykonaj następujące zadania:
-            KROK 1:
-                - Sprawdź, czy plik to **rzeczywiste zdjęcie (bitmapa)** przedstawiające scenę, przedmiot, osobę, miejsce itp.
-                - Odrzuć **grafiki wektorowe, ikony, schematy, tekst, mockupy, schematy**, rysunki kreskówkowe lub generowane miniatury.
-            KROK 2:
-                - Oceń, czy zawartość zdjęcia **wiąże się logicznie i semantycznie z podanym tekstem**.
-            KROK 3:
-                - Nie zgaduj — jeżeli zdjęcie jest niejasne lub niepewne — uznaj, że nie pasuje.
-                
-            Wejście:
-            Tekst do porównania: "{text_fragment[:200]}"
-            
-            JSON: {{ "suitable": true/false, "reason": "..." }}
-            
-            Przykłady:
-                - jeżeli zdjęcie przedstawia scenę opisaną w tekście → suitable: true
-                - jeżeli jest to wizualizacja wykresu, wektor, meme lub nie ma związku → suitable: false
-            """
+                        Czy to zdjęcie pasuje do tematu: "{text_fragment[:200]}"?
+                        oraz kategorii: {queries}?
+                        Odrzuć grafiki, tekst, wektory.
+                        JSON: {{ "suitable": true/false, "reason": "..." }}
+                        """
             try:
-                res = await self.llm_model.generate_content_async([check_prompt, img], generation_config={"response_mime_type": "application/json"})
+                res = await self._gemini_generate(
+                    [check_prompt, img],
+                    generation_config={"response_mime_type": "application/json"},
+                )
                 self.cost_calc.add_gemini_usage(res.usage_metadata)
                 verdict = json.loads(res.text)
                 c['check'] = verdict
                 if verdict.get('suitable'): final.append(c)
             except Exception:
                 logger.warning("Błąd weryfikacji Gemini dla jednego zdjęcia", exc_info=True)
-            
+
         # Fallback
-        if not final and top_cands:
+        if allow_fallback and not final and top_cands:
             logger.warning("Brak zaakceptowanych zdjęć przez Gemini, używam fallback (Top 1 SigLIP)")
             top_cands[0]['check'] = {"suitable": True, "reason": "Fallback: SigLIP best match"}
             final.append(top_cands[0])
-            
+
         # Logowanie kosztów na koniec requestu
         self.cost_calc.log_summary()
         return final
+
 
 # ==========================================
 # CZĘŚĆ 2: SERWIS WEBOWY (STARLETTE)
@@ -341,26 +408,48 @@ async def lifespan(app):
     finally:
         logger.info("🛑 Zamykanie aplikacji", extra={"event": "shutdown"})
 
+
+def has_suitable_result(results: list[dict]) -> bool:
+    for result in results:
+        if result.get("check", {}).get("suitable") is True and isinstance(
+                result.get("siglip_score"), (int, float)
+        ):
+            return True
+    return False
+
+
 async def analyze_endpoint(request: Request):
     # Generowanie kontekstu requestu dla logów (jeśli OTel nie złapie)
     start_time = time.time()
     try:
         body = await request.json()
         text = body.get("text")
-        
+
         if not text:
             logger.warning("Otrzymano request bez pola 'text'", extra={"status": 400})
             return JSONResponse({"error": "Brak pola 'text' w JSON"}, status_code=400)
-        
-        results = await request.app.state.router.process_article(text)
-        
+
+        max_attempts = 3
+        results = []
+        for attempt in range(1, max_attempts + 1):
+            results = await request.app.state.router.process_article(
+                text,
+                allow_fallback=False,
+            )
+            if has_suitable_result(results):
+                break
+            logger.warning(
+                "Brak suitable wynikow, ponawiam przetwarzanie",
+                extra={"attempt": attempt, "max_attempts": max_attempts},
+            )
+
         duration = time.time() - start_time
         logger.info("Przetworzono request", extra={
-            "status": 200, 
-            "result_count": len(results), 
+            "status": 200,
+            "result_count": len(results),
             "duration": round(duration, 3)
         })
-        
+
         return JSONResponse({
             "status": "success",
             "count": len(results),
@@ -371,10 +460,12 @@ async def analyze_endpoint(request: Request):
         logger.error("Nieobsłużony błąd w endpoincie", exc_info=True, extra={"status": 500})
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+
 async def health_check(request):
     # Healthcheck nie musi generować dużej ilości logów, chyba że debug
     logger.debug("Health check probe")
     return JSONResponse({"status": "online"})
+
 
 routes = [
     Route("/analyze", endpoint=analyze_endpoint, methods=["POST"]),
