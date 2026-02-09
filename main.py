@@ -202,28 +202,85 @@ class AsyncSmartRouter:
         return None
 
     def _download_image_sync(self, url):
+        """
+        Pobiera obraz i AUTOMATYCZNIE przycina go do 16:9.
+        """
         try:
-            resp = requests.get(url, stream=True, timeout=4, headers={"User-Agent": "Bot/1.0"})
+            resp = requests.get(url, stream=True, timeout=5, headers={"User-Agent": "Bot/1.0"})
             if resp.status_code == 200:
-                return Image.open(BytesIO(resp.content)).convert("RGB")
+                img = Image.open(BytesIO(resp.content)).convert("RGB")
+                
+                # TUTAJ DZIEJE SIĘ MAGIA:
+                # Przycinamy obraz zanim trafi do SigLIPa lub Gemini
+                img_cropped = self._crop_to_16_9(img)
+                
+                return img_cropped
         except Exception as e:
-            logger.warning(f"Błąd pobierania obrazka", extra={"url": url, "error": str(e)})
+            logger.warning(f"Błąd pobierania/cropowania", extra={"url": url, "error": str(e)})
             return None
+        
+    def _crop_to_16_9(self, img: Image.Image) -> Image.Image:
+        """
+        Inteligentne przycinanie (Center Crop) do formatu 16:9.
+        Działa na obiekcie PIL.Image.
+        """
+        original_width, original_height = img.size
+        target_ratio = 16 / 9
+        current_ratio = original_width / original_height
 
-    # --- API SEARCH METHODS ---
-    async def search_stock(self, session, query, limit=3):
+        if current_ratio == target_ratio:
+            return img
+
+        if current_ratio > target_ratio:
+            # Obraz jest za szeroki (np. panorama) -> przycinamy boki
+            new_width = int(original_height * target_ratio)
+            offset = (original_width - new_width) // 2
+            # box = (left, upper, right, lower)
+            return img.crop((offset, 0, original_width - offset, original_height))
+        else:
+            # Obraz jest za wysoki (np. 3:2, 4:3) -> przycinamy górę i dół
+            new_height = int(original_width / target_ratio)
+            offset = (original_height - new_height) // 2
+            return img.crop((0, offset, original_width, original_height - offset))
+
+    def _is_wide_enough(self, width: int, height: int) -> bool:
+        """
+        Sprawdza, czy zdjęcie jest poziome (landscape).
+        Akceptujemy 3:2, 4:3, 16:10 itd., bo i tak je przytniemy.
+        Odrzucamy tylko pionowe i kwadraty, bo po przycięciu do 16:9 zostałby wąski pasek.
+        """
+        if not width or not height:
+            return False
+        # Wymagamy, aby szerokość była przynajmniej 1.2 razy większa od wysokości.
+        # To eliminuje kwadraty i piony, ale przepuszcza standardowe zdjęcia z aparatów.
+        return width > (height * 1.2)
+
+    # --- API SEARCH (ZAKTUALIZOWANE) ---
+
+    async def search_stock(self, session, query, limit=5):
         tasks = []
-        # Pexels
+        
+        # 1. Pexels (orientation=landscape)
         if PEXELS_API_KEY:
-            tasks.append(self._fetch_json(session, "https://api.pexels.com/v1/search",
-                                          {"query": query, "per_page": limit}, {"Authorization": PEXELS_API_KEY},
-                                          source="Pexels"))
-        # Pixabay
+            tasks.append(self._fetch_json(
+                session, 
+                "https://api.pexels.com/v1/search",
+                {"query": query, "per_page": limit, "orientation": "landscape"}, 
+                {"Authorization": PEXELS_API_KEY},
+                source="Pexels"
+            ))
+            
+        # 2. Pixabay (orientation=horizontal)
         if PIXABAY_API_KEY:
-            tasks.append(self._fetch_json(session, "https://pixabay.com/api/",
-                                          {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo",
-                                           "safesearch": "true", "per_page": limit}, source="Pixabay"))
-        # Unsplash
+            tasks.append(self._fetch_json(
+                session, 
+                "https://pixabay.com/api/",
+                {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo",
+                 "safesearch": "true", "per_page": limit, "orientation": "horizontal"}, 
+                source="Pixabay"
+            ))
+            
+        # 3. Unsplash (orientation=landscape)
         if UNSPLASH_ACCESS_KEY:
             tasks.append(
                 self._fetch_json(
@@ -242,28 +299,49 @@ class AsyncSmartRouter:
                 )
             )
 
-        results = []
+        raw_results = []
         responses = await asyncio.gather(*tasks)
 
-        # Parsowanie wyników
         for data in responses:
             if not data: continue
+            
             # Pexels
             if 'photos' in data:
-                results.extend([{"source": "Pexels", "thumb_url": p['src']['medium'], "full_url": p['src']['original'],
-                                 "id": str(p['id'])} for p in data['photos']])
+                for p in data['photos']:
+                    # Używamy nowej luźniejszej funkcji filtrującej
+                    if self._is_wide_enough(p.get('width'), p.get('height')):
+                        raw_results.append({
+                            "source": "Pexels", 
+                            "thumb_url": p['src']['large2x'], # Bierzemy większe do cropowania
+                            "full_url": p['src']['original'],
+                            "id": str(p['id'])
+                        })
+                        
             # Pixabay
             elif 'hits' in data:
-                results.extend([{"source": "Pixabay", "thumb_url": h.get('webformatURL'),
-                                 "full_url": h.get('largeImageURL'), "id": str(h['id'])} for h in data['hits']])
+                for h in data['hits']:
+                    if self._is_wide_enough(h.get('imageWidth'), h.get('imageHeight')):
+                        raw_results.append({
+                            "source": "Pixabay", 
+                            "thumb_url": h.get('largeImageURL'), # Pixabay webformat może być za mały na dobry crop
+                            "full_url": h.get('largeImageURL'), 
+                            "id": str(h['id'])
+                        })
+                        
             # Unsplash
             elif 'results' in data:
-                results.extend([{"source": "Unsplash", "thumb_url": i['urls']['small'],
-                                 "full_url": i['urls']['regular'], "id": i['id']} for i in data['results']])
+                for i in data['results']:
+                    if self._is_wide_enough(i.get('width'), i.get('height')):
+                        raw_results.append({
+                            "source": "Unsplash", 
+                            "thumb_url": i['urls']['regular'], # Regular jest wystarczający (~1080px width)
+                            "full_url": i['urls']['full'], 
+                            "id": i['id']
+                        })
 
-        logger.info(f"Znaleziono kandydatów dla '{query}'", extra={"count": len(results), "query": query})
-        return results
-
+        # Deduplikacja po URL miniaturki
+        unique = {c['thumb_url']: c for c in raw_results}.values()
+        return list(unique)
     # --- MAIN LOGIC ---
     async def process_article(self, text_fragment, *, allow_fallback: bool = True):
         # 1. GENEROWANIE ZAPYTAŃ

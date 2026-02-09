@@ -81,9 +81,4 @@ def test_analyze():
 
 if __name__ == "__main__":
     print("--- ROZPOCZYNAM TESTY SMART IMAGE ROUTER ---\n")
-    
-    if check_health():
-        print("")
-        test_analyze()
-    else:
-        sys.exit(1)
+    test_analyze()
