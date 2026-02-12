@@ -19,6 +19,8 @@ from pythonjsonlogger import jsonlogger
 
 # Starlette imports
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.requests import Request
@@ -550,7 +552,16 @@ routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
 ]
 
-app = Starlette(debug=False, routes=routes, lifespan=lifespan)
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+]
+
+app = Starlette(debug=False, routes=routes, lifespan=lifespan, middleware=middleware)
 
 if __name__ == "__main__":
     # Konfiguracja uvicorn logging jest nadpisywana przez naszą konfigurację globalną
