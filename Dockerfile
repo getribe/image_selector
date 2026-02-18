@@ -1,12 +1,10 @@
 # Python 3.12 slim
 FROM python:3.12-slim
 
-# --- ENV ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/model_cache \
-    CUDA_VISIBLE_DEVICES="" \
-    TORCH_CUDA_ARCH_LIST=""
+    PIP_NO_CACHE_DIR=1 \
+    POETRY_VIRTUALENVS_CREATE=false
 
 # --- SYSTEM DEPS ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,20 +13,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# --- 🔑 PYTORCH CPU ONLY (KLUCZOWE) ---
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cpu
+# --- INSTALL POETRY ---
+RUN pip install poetry
 
-# --- POETRY ---
-RUN pip install --no-cache-dir poetry
-
-# --- DEPENDENCIES ---
+# --- COPY CONFIGS ---
 COPY pyproject.toml poetry.lock* /app/
 
-RUN poetry config virtualenvs.create false \
-    && poetry install --no-interaction --no-ansi --only main
-
+# --- INSTALL DEPENDENCIES ---
+# 1. We install the CPU wheels first
+# 2. We tell poetry to install everything ELSE, skipping the torch it would normally pull
+# --- INSTALL DEPENDENCIES ---
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
+    && poetry install --no-interaction --no-ansi --only main \
+    && rm -rf /root/.cache/pypoetry \
+    && rm -rf /root/.cache/pip
 # --- APP ---
 COPY main.py /app/
 
