@@ -61,6 +61,27 @@ class TraceContextFilter(logging.Filter):
         return True
 
 
+class LokiJsonFormatter(jsonlogger.JsonFormatter):
+    """
+    JSON formatter pod Loki:
+    - spłaszcza legacy `extra_fields` do top-level,
+    - normalizuje wyjątki do pola `exception`,
+    - dodaje domyślne pole `service`.
+    """
+
+    def process_log_record(self, log_record):
+        extra_fields = log_record.pop("extra_fields", None)
+        if isinstance(extra_fields, dict):
+            for key, value in extra_fields.items():
+                log_record.setdefault(key, value)
+
+        if log_record.get("exc_info") and "exception" not in log_record:
+            log_record["exception"] = log_record["exc_info"]
+
+        log_record.setdefault("service", os.getenv("SERVICE_NAME", "image_selector"))
+        return log_record
+
+
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -68,7 +89,7 @@ def setup_logging():
     handler = logging.StreamHandler(sys.stdout)
 
     # Format JSON zawierający timestamp, poziom, wiadomość i klucze tracingowe
-    formatter = jsonlogger.JsonFormatter(
+    formatter = LokiJsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s %(trace_id)s %(span_id)s',
         rename_fields={"levelname": "level", "asctime": "timestamp"},
         datefmt='%Y-%m-%dT%H:%M:%SZ'
