@@ -32,4 +32,4 @@ COPY main.py /app/
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "--timeout", "120", "--bind", "0.0.0.0:8000", "main:app"]
+CMD ["opentelemetry-instrument", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "--timeout", "120", "--bind", "0.0.0.0:8000", "main:app"]

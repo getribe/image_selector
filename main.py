@@ -7,15 +7,13 @@ import torch
 import logging
 import sys
 import uvicorn
+import httpx
 import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import List
 from PIL import Image
 from google.api_core.exceptions import ResourceExhausted
-
-# Logging & Observability
-from pythonjsonlogger import jsonlogger
 
 # Starlette imports
 from starlette.applications import Starlette
@@ -31,85 +29,94 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 
 
-# --- KONFIGURACJA LOGOWANIA (Loki & Tempo Friendly) ---
+# --- KONFIGURACJA LOGOWANIA ---
 
-class TraceContextFilter(logging.Filter):
-    """
-    Filtr dodający trace_id i span_id do każdego rekordu logu.
-    Dzięki temu Loki będzie mógł skorelować logi z Tempo.
-    """
+from datetime import datetime
+from typing import Dict, Optional
 
-    def filter(self, record):
-        # Domyślne wartości
-        record.trace_id = ""
-        record.span_id = ""
 
+class LokiHandler(logging.Handler):
+    def __init__(self, loki_url: str, job_name: str, extra_labels: Optional[Dict[str, str]] = None):
+        super().__init__()
+        self.loki_url = loki_url.rstrip('/')
+        self.push_url = f"{self.loki_url}/loki/api/v1/push"
+        self.job_name = job_name
+        self.extra_labels = extra_labels or {}
+        self.client = httpx.Client(timeout=5.0)
+
+    def emit(self, record: logging.LogRecord):
         try:
-            # Próbujemy pobrać kontekst z OpenTelemetry (nawet jak jest wstrzyknięte auto-instrumentation)
-            from opentelemetry import trace
-            span = trace.get_current_span()
-            if span != trace.NonRecordingSpan(None):
-                ctx = span.get_span_context()
-                if ctx.is_valid:
-                    record.trace_id = f"{ctx.trace_id:032x}"
-                    record.span_id = f"{ctx.span_id:016x}"
-        except ImportError:
-            pass  # OTel nie jest zainstalowany lub dostępny
-        except Exception:
-            pass  # Inny błąd, nie chcemy przerywać logowania
+            log_entry = self.format(record)
+            timestamp_ns = str(int(record.created * 1_000_000_000))
+            labels = {
+                "job": self.job_name,
+                "level": record.levelname.lower(),
+                "logger": record.name,
+                **self.extra_labels,
+            }
+            payload = {
+                "streams": [
+                    {
+                        "stream": labels,
+                        "values": [[timestamp_ns, log_entry]]
+                    }
+                ]
+            }
+            self.client.post(self.push_url, json=payload)
+        except Exception as e:
+            print(f"Failed to send log to Loki: {e}")
 
-        return True
-
-
-class LokiJsonFormatter(jsonlogger.JsonFormatter):
-    """
-    JSON formatter pod Loki:
-    - spłaszcza legacy `extra_fields` do top-level,
-    - normalizuje wyjątki do pola `exception`,
-    - dodaje domyślne pole `service`.
-    """
-
-    def process_log_record(self, log_record):
-        extra_fields = log_record.pop("extra_fields", None)
-        if isinstance(extra_fields, dict):
-            for key, value in extra_fields.items():
-                log_record.setdefault(key, value)
-
-        if log_record.get("exc_info") and "exception" not in log_record:
-            log_record["exception"] = log_record["exc_info"]
-
-        log_record.setdefault("service", os.getenv("SERVICE_NAME", "image_selector"))
-        return log_record
+    def close(self):
+        try:
+            self.client.close()
+        except:
+            pass
+        super().close()
 
 
-def setup_logging():
+class StructuredFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_data = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, 'extra_fields'):
+            log_data.update(record.extra_fields)
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_data, ensure_ascii=False)
+
+
+def setup_loki_logging(job_name: str = "image_selector", level: int = logging.INFO):
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
 
-    handler = logging.StreamHandler(sys.stdout)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(StructuredFormatter())
+    logger.addHandler(console_handler)
 
-    # Format JSON zawierający timestamp, poziom, wiadomość i klucze tracingowe
-    formatter = LokiJsonFormatter(
-        '%(asctime)s %(levelname)s %(name)s %(message)s %(trace_id)s %(span_id)s',
-        rename_fields={"levelname": "level", "asctime": "timestamp"},
-        datefmt='%Y-%m-%dT%H:%M:%SZ'
-    )
+    loki_url = os.getenv("LOKI_URL")
+    if loki_url:
+        try:
+            loki_handler = LokiHandler(
+                loki_url=loki_url,
+                job_name=job_name,
+                extra_labels={"service": job_name}
+            )
+            loki_handler.setFormatter(StructuredFormatter())
+            logger.addHandler(loki_handler)
+        except Exception as e:
+            logger.warning(f"Failed to setup Loki handler: {e}")
 
-    handler.setFormatter(formatter)
-    handler.addFilter(TraceContextFilter())
-
-    # Usuwamy domyślne handlery (żeby nie dublować logów)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    logger.addHandler(handler)
-
-    # Wyciszenie bibliotek, które mogą za bardzo hałasować
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # Uvicorn ma własne logi access
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    return logger
 
 
-setup_logging()
+setup_loki_logging()
 logger = logging.getLogger("ImageService")
 
 # --- KONFIGURACJA ZMIENNYCH ---
