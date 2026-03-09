@@ -22,7 +22,6 @@ dependencies = [
     "python-dotenv (>=1.2.1,<2.0.0)",
     "sentencepiece (>=0.2.1,<0.3.0)",
     "protobuf (<6.0.0)",
-    "httpx (>=0.28,<0.29)",
     "opentelemetry-api (>=1.39.1,<2.0.0)",
     "opentelemetry-sdk (>=1.39.1,<2.0.0)",
     "opentelemetry-instrumentation-asgi (>=0.60b1,<0.61)",

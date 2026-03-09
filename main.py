@@ -7,7 +7,6 @@ import torch
 import logging
 import sys
 import uvicorn
-import httpx
 import time
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -32,46 +31,6 @@ from dotenv import load_dotenv
 # --- KONFIGURACJA LOGOWANIA ---
 
 from datetime import datetime
-from typing import Dict, Optional
-
-
-class LokiHandler(logging.Handler):
-    def __init__(self, loki_url: str, job_name: str, extra_labels: Optional[Dict[str, str]] = None):
-        super().__init__()
-        self.loki_url = loki_url.rstrip('/')
-        self.push_url = f"{self.loki_url}/loki/api/v1/push"
-        self.job_name = job_name
-        self.extra_labels = extra_labels or {}
-        self.client = httpx.Client(timeout=5.0)
-
-    def emit(self, record: logging.LogRecord):
-        try:
-            log_entry = self.format(record)
-            timestamp_ns = str(int(record.created * 1_000_000_000))
-            labels = {
-                "job": self.job_name,
-                "level": record.levelname.lower(),
-                "logger": record.name,
-                **self.extra_labels,
-            }
-            payload = {
-                "streams": [
-                    {
-                        "stream": labels,
-                        "values": [[timestamp_ns, log_entry]]
-                    }
-                ]
-            }
-            self.client.post(self.push_url, json=payload)
-        except Exception as e:
-            print(f"Failed to send log to Loki: {e}")
-
-    def close(self):
-        try:
-            self.client.close()
-        except:
-            pass
-        super().close()
 
 
 class StructuredFormatter(logging.Formatter):
@@ -89,10 +48,7 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(log_data, ensure_ascii=False)
 
 
-def setup_loki_logging(job_name: str = "image_selector", level: int = logging.INFO):
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
+def setup_logging(level: int = logging.INFO):
     logger = logging.getLogger()
     logger.setLevel(level)
 
@@ -100,23 +56,10 @@ def setup_loki_logging(job_name: str = "image_selector", level: int = logging.IN
     console_handler.setFormatter(StructuredFormatter())
     logger.addHandler(console_handler)
 
-    loki_url = os.getenv("LOKI_URL")
-    if loki_url:
-        try:
-            loki_handler = LokiHandler(
-                loki_url=loki_url,
-                job_name=job_name,
-                extra_labels={"service": job_name}
-            )
-            loki_handler.setFormatter(StructuredFormatter())
-            logger.addHandler(loki_handler)
-        except Exception as e:
-            logger.warning(f"Failed to setup Loki handler: {e}")
-
     return logger
 
 
-setup_loki_logging()
+setup_logging()
 logger = logging.getLogger("ImageService")
 
 # --- KONFIGURACJA ZMIENNYCH ---
