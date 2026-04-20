@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import List
 from PIL import Image
-from google.api_core.exceptions import ResourceExhausted
 
 # Starlette imports
 from starlette.applications import Starlette
@@ -24,7 +23,9 @@ from starlette.requests import Request
 
 # ML & AI imports
 from transformers import AutoProcessor, AutoModel
-import google.generativeai as genai
+import base64
+from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 
 
@@ -69,9 +70,7 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY")
 
-if GOOGLE_GENAI_KEY:
-    genai.configure(api_key=GOOGLE_GENAI_KEY)
-else:
+if not GOOGLE_GENAI_KEY:
     logger.critical("Brak klucza GOOGLE_GENAI_KEY! Aplikacja nie zadziała poprawnie.")
 
 
@@ -139,25 +138,58 @@ class LocalVisualRanker:
 class AsyncSmartRouter:
     def __init__(self):
         self.cost_calc = CostCalculator()
-        self.ranker = LocalVisualRanker()  # Model ładuje się tutaj
-        self.llm_model = genai.GenerativeModel('gemini-3-flash-preview')
-        # Prosty limiter: serializuje requesty do Gemini; retry z odczekaniem tylko na 429.
+        self.ranker = LocalVisualRanker()
+        self.client = genai.Client(api_key=GOOGLE_GENAI_KEY)
         self._gemini_lock = asyncio.Lock()
 
-    async def _gemini_generate(self, *args, **kwargs):
+    async def _gemini_generate(self, contents, *, response_mime_type: str = "application/json"):
         async with self._gemini_lock:
             max_attempts = 2
             for attempt in range(1, max_attempts + 1):
                 try:
-                    return await self.llm_model.generate_content_async(*args, **kwargs)
-                except ResourceExhausted:
-                    if attempt >= max_attempts:
-                        raise
-                    logger.warning(
-                        "Gemini quota hit (429), czekam 25s przed ponowieniem",
-                        extra={"wait_seconds": 25, "attempt": attempt},
+                    return await self.client.aio.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents=contents,
+                        config=genai_types.GenerateContentConfig(
+                            response_mime_type=response_mime_type,
+                        ),
                     )
-                    await asyncio.sleep(25)
+                except Exception as e:
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e).upper():
+                        if attempt >= max_attempts:
+                            raise
+                        logger.warning("Gemini quota hit, czekam 25s", extra={"attempt": attempt})
+                        await asyncio.sleep(25)
+                    else:
+                        raise
+
+    def _generate_image_sync(self, prompt: str) -> dict | None:
+        try:
+            response = self.client.models.generate_images(
+                model="imagen-3.0-fast-generate-001",
+                prompt=prompt,
+                config=genai_types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio="16:9",
+                    person_generation="DONT_ALLOW",
+                ),
+            )
+            if not response.generated_images:
+                return None
+            img_bytes = response.generated_images[0].image.image_bytes
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{b64}"
+            return {
+                "source": "AI Generated",
+                "thumb_url": data_url,
+                "full_url": data_url,
+                "id": "ai-generated",
+                "siglip_score": None,
+                "check": {"suitable": True, "reason": "Wygenerowane przez Imagen 3 na podstawie treści artykułu."},
+            }
+        except Exception:
+            logger.warning("Błąd generowania zdjęcia Imagen 3", exc_info=True)
+            return None
 
     async def _fetch_json(self, session, url, params=None, headers=None, source="API"):
         start_time = time.time()
@@ -336,10 +368,7 @@ class AsyncSmartRouter:
         }}
         """
         try:
-            resp = await self._gemini_generate(
-                prompt,
-                generation_config={"response_mime_type": "application/json"},
-            )
+            resp = await self._gemini_generate(prompt)
             self.cost_calc.add_gemini_usage(resp.usage_metadata)
             plan = json.loads(resp.text)
         except Exception as e:
@@ -368,11 +397,14 @@ class AsyncSmartRouter:
 
         logger.info("Wygenerowano plan", extra={"queries": queries, "siglip_prompt": siglip_prompt})
 
-        # 2. POBIERANIE METADANYCH
+        # 2. POBIERANIE METADANYCH + GENEROWANIE AI RÓWNOLEGLE
+        imagen_prompt = f"News editorial photo: {visual_subject}. Photorealistic, no text, no logos."
         candidates = []
         async with aiohttp.ClientSession() as session:
-            tasks = [self.search_stock(session, q) for q in queries]
-            groups = await asyncio.gather(*tasks)
+            stock_tasks = [self.search_stock(session, q) for q in queries]
+            loop = asyncio.get_running_loop()
+            imagen_future = loop.run_in_executor(None, self._generate_image_sync, imagen_prompt)
+            groups = await asyncio.gather(*stock_tasks)
             for g in groups: candidates.extend(g)
 
         # Deduplikacja
@@ -380,8 +412,9 @@ class AsyncSmartRouter:
         candidates = list(unique)
 
         if not candidates:
-            logger.warning("Nie znaleziono żadnych zdjęć w API")
-            return []
+            logger.warning("Nie znaleziono zdjęć w stockach, używam tylko Imagen 3")
+            ai_img = await imagen_future
+            return [ai_img] if ai_img else []
 
         # 3. RANKING SIGLIP
         to_check = candidates[:15]
@@ -414,17 +447,13 @@ class AsyncSmartRouter:
             img = self._download_image_sync(c['thumb_url'])
             if not img: continue
 
-            check_prompt = f"""
-                        Czy to zdjęcie pasuje do tematu: "{text_fragment[:200]}"?
-                        oraz kategorii: {queries}?
-                        Odrzuć grafiki, tekst, wektory.
-                        JSON: {{ "suitable": true/false, "reason": "..." }}
-                        """
+            check_prompt = (
+                f'Czy to zdjęcie pasuje do tematu: "{text_fragment[:200]}"? '
+                f'Kategorie: {queries}. Odrzuć grafiki, tekst, wektory. '
+                f'JSON: {{"suitable": true/false, "reason": "..."}}'
+            )
             try:
-                res = await self._gemini_generate(
-                    [check_prompt, img],
-                    generation_config={"response_mime_type": "application/json"},
-                )
+                res = await self._gemini_generate([check_prompt, img])
                 self.cost_calc.add_gemini_usage(res.usage_metadata)
                 verdict = json.loads(res.text)
                 c['check'] = verdict
@@ -432,11 +461,19 @@ class AsyncSmartRouter:
             except Exception:
                 logger.warning("Błąd weryfikacji Gemini dla jednego zdjęcia", exc_info=True)
 
-        # Fallback
+        # Fallback jeśli żadne stockowe nie przeszło weryfikacji
         if allow_fallback and not final and top_cands:
             logger.warning("Brak zaakceptowanych zdjęć przez Gemini, używam fallback (Top 1 SigLIP)")
             top_cands[0]['check'] = {"suitable": True, "reason": "Fallback: SigLIP best match"}
             final.append(top_cands[0])
+
+        # 5. DOŁĄCZ OBRAZ AI (zawsze jako ostatni)
+        ai_img = await imagen_future
+        if ai_img:
+            final.append(ai_img)
+            logger.info("Dodano zdjęcie wygenerowane przez Imagen 3")
+        else:
+            logger.warning("Imagen 3 nie zwrócił zdjęcia")
 
         # Logowanie kosztów na koniec requestu
         self.cost_calc.log_summary()
