@@ -3,7 +3,8 @@ name = "smart-image-router"
 version = "0.1.0"
 description = "AI Image Ranking Service"
 authors = [
-    {name = "Scheida",email = "maciej.wrzeszcz.solutions@gmail.com"}
+    { name = "Maciej Wrzeszcz", email = "maciej.wrzeszcz@getribe.pl" },
+    { name = "Paweł Karaszewski", email = "pawel.karaszewski@getribe.pl" },
 ]
 readme = "README.md"
 requires-python = ">=3.12, <3.13"
